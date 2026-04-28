@@ -375,11 +375,28 @@
     "data/VID_20250911_112759_00_015.insv",
   ];
 
-  const equirectAvailable = {};   // data/equirect/ ffmpeg-converted files
-  const studioAvailable   = {};   // equi_video/ Insta360 Studio exports (highest quality)
+  // ── Cloudflare R2 CDN (used when not running on localhost) ───────────────
+  const CDN = "https://assets02.aitkena.com/proxy_360";
 
-  let clips   = [];
-  let current = 0;
+  // Pre-defined remote clips: studio export for 014, ffmpeg equirect for the rest.
+  // Source of truth after uploading to R2 with upload_r2.py.
+  const CDN_CLIPS = [
+    { type: "eq",     url: `${CDN}/equirect/VID_20250911_112037_00_010.mp4` },
+    { type: "eq",     url: `${CDN}/equirect/VID_20250911_112219_00_011.mp4` },
+    { type: "eq",     url: `${CDN}/equirect/VID_20250911_112357_00_012.mp4` },
+    { type: "eq",     url: `${CDN}/equirect/VID_20250911_112532_00_013.mp4` },
+    { type: "studio", url: `${CDN}/studio/VID_20250911_112550_00_014_web.mp4` },
+    { type: "eq",     url: `${CDN}/equirect/VID_20250911_112759_00_015.mp4` },
+  ];
+
+  const IS_LOCAL = ["localhost", "127.0.0.1", ""].includes(window.location.hostname);
+
+  const equirectAvailable = {};
+  const studioAvailable   = {};
+
+  let clips     = [];   // resolved URLs
+  let clipTypes = [];   // "eq" | "studio" | "raw"
+  let current   = 0;
   let videoEl = null;
   let assetId = null;
 
@@ -455,20 +472,19 @@
   }
 
   function updateUI() {
-    const src      = clips[current] || "";
-    const isStudio = !!studioAvailable[current];
-    const isEq     = !isStudio && src.endsWith(".mp4");
+    const src  = clips[current] || "";
+    const type = clipTypes[current] || "raw";
     label.textContent   = basename(src);
     counter.textContent = `${current + 1} / ${clips.length}`;
-    if (isStudio) { badge.textContent = "studio"; badge.className = "badge studio"; }
-    else if (isEq){ badge.textContent = "360°";   badge.className = "badge eq"; }
-    else          { badge.textContent = "raw";     badge.className = "badge raw"; }
+    if (type === "studio") { badge.textContent = "studio"; badge.className = "badge studio"; }
+    else if (type === "eq"){ badge.textContent = "360°";   badge.className = "badge eq"; }
+    else                   { badge.textContent = "raw";    badge.className = "badge raw"; }
     prevBtn.disabled = current === 0;
     nextBtn.disabled = current === clips.length - 1;
 
     document.querySelectorAll(".clip-btn").forEach((btn, i) => {
       btn.classList.toggle("active",  i === current);
-      btn.classList.toggle("has-eq", !!(studioAvailable[i] || equirectAvailable[i]));
+      btn.classList.toggle("has-eq", clipTypes[i] === "studio" || clipTypes[i] === "eq");
     });
 
     const active = strip.querySelector(".clip-btn.active");
@@ -504,40 +520,50 @@
 
   async function probeClip(insv, i) {
     const name = insv.split("/").pop().replace(/\.insv$/i, "");
-    // Check full-quality Studio export first, then web-optimised fallback,
-    // then ffmpeg equirect, then raw insv.
     const [studioRes, studioWebRes, eqRes] = await Promise.all([
-      fetch(`equi_video/${name}.mp4`,      { method: "HEAD" }).catch(() => null),
-      fetch(`equi_video/${name}_web.mp4`,  { method: "HEAD" }).catch(() => null),
-      fetch(`data/equirect/${name}.mp4`,   { method: "HEAD" }).catch(() => null),
+      fetch(`equi_video/${name}.mp4`,     { method: "HEAD" }).catch(() => null),
+      fetch(`equi_video/${name}_web.mp4`, { method: "HEAD" }).catch(() => null),
+      fetch(`data/equirect/${name}.mp4`,  { method: "HEAD" }).catch(() => null),
     ]);
-    if (studioRes?.ok)    studioAvailable[i] = `equi_video/${name}.mp4`;
-    else if (studioWebRes?.ok) studioAvailable[i] = `equi_video/${name}_web.mp4`;
-    if (eqRes?.ok)        equirectAvailable[i] = `data/equirect/${name}.mp4`;
+    if (studioRes?.ok)         studioAvailable[i]   = `equi_video/${name}.mp4`;
+    else if (studioWebRes?.ok) studioAvailable[i]   = `equi_video/${name}_web.mp4`;
+    if (eqRes?.ok)             equirectAvailable[i] = `data/equirect/${name}.mp4`;
   }
 
   async function init() {
-    const insvList = STATIC_CLIPS_INSV.slice();
+    if (!IS_LOCAL) {
+      // ── Remote / GitHub Pages: use pre-defined CDN URLs directly ──────────
+      clips     = CDN_CLIPS.map(c => c.url);
+      clipTypes = CDN_CLIPS.map(c => c.type);
+      buildStrip();
+      loadClip(0);
+      return;
+    }
 
+    // ── Local: probe for files and prefer highest quality ──────────────────
+    const insvList = STATIC_CLIPS_INSV.slice();
     await Promise.all(insvList.map((insv, i) => probeClip(insv, i)));
 
-    // Priority: Studio export > ffmpeg equirect > raw .insv
-    clips = insvList.map((insv, i) =>
-      studioAvailable[i] || equirectAvailable[i] || insv
+    clips     = insvList.map((insv, i) => studioAvailable[i] || equirectAvailable[i] || insv);
+    clipTypes = insvList.map((insv, i) =>
+      studioAvailable[i] ? "studio" : equirectAvailable[i] ? "eq" : "raw"
     );
 
     buildStrip();
     loadClip(0);
 
-    // Poll for new files while page is open
     setInterval(async () => {
       let changed = false;
       await Promise.all(insvList.map(async (insv, i) => {
-        if (studioAvailable[i]) return;   // already best quality
+        if (studioAvailable[i]) return;
         const before = clips[i];
         await probeClip(insv, i);
         const after = studioAvailable[i] || equirectAvailable[i] || insv;
-        if (after !== before) { clips[i] = after; changed = true; }
+        if (after !== before) {
+          clips[i]     = after;
+          clipTypes[i] = studioAvailable[i] ? "studio" : equirectAvailable[i] ? "eq" : "raw";
+          changed = true;
+        }
       }));
       if (changed) { buildStrip(); updateUI(); }
     }, 15_000);

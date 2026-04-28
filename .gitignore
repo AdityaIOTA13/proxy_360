@@ -8,5 +8,9 @@ data/equirect/
 *.mp4
 !equi_video/*_web.mp4
 
+# Credentials / secrets — never commit these
+cloudflare_r2_complete.json
+upload_r2.py
+
 # macOS
 .DS_Store
