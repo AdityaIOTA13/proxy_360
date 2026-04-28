@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>360 Viewer</title>
+  <script src="https://aframe.io/releases/1.5.0/aframe.min.js"></script>
+  <script>
+  // ─────────────────────────────────────────────────────────────
+  // Custom look controls: pure yaw + pitch, zero roll, no gimbal
+  // Uses Pointer Events (mouse + touch unified) on the canvas only.
+  // ─────────────────────────────────────────────────────────────
+  AFRAME.registerComponent('free-look', {
+    schema: { sensitivity: { default: 0.22 } },
+
+    init() {
+      this.yaw   = 0;
+      this.pitch = 0;
+      this.down  = false;
+      this.lastX = 0;
+      this.lastY = 0;
+
+      // Use YXZ Euler order: yaw around world-Y first, then pitch local-X
+      this.el.object3D.rotation.order = 'YXZ';
+
+      this._pd = this._pd.bind(this);
+      this._pm = this._pm.bind(this);
+      this._pu = this._pu.bind(this);
+
+      // Attach pointerdown to canvas so UI buttons don't start a drag
+      this.el.sceneEl.addEventListener('loaded', () => {
+        const c = this.el.sceneEl.canvas;
+        c.addEventListener('pointerdown', this._pd);
+        window.addEventListener('pointermove', this._pm);
+        window.addEventListener('pointerup',   this._pu);
+      });
+    },
+
+    remove() {
+      const c = this.el.sceneEl.canvas;
+      if (c) c.removeEventListener('pointerdown', this._pd);
+      window.removeEventListener('pointermove', this._pm);
+      window.removeEventListener('pointerup',   this._pu);
+    },
+
+    _pd(e) {
+      if (e.button !== undefined && e.button !== 0) return;
+      this.down  = true;
+      this.lastX = e.clientX;
+      this.lastY = e.clientY;
+    },
+    _pm(e) {
+      if (!this.down) return;
+      const s = this.data.sensitivity;
+      this.yaw   -= (e.clientX - this.lastX) * s;
+      this.pitch -= (e.clientY - this.lastY) * s;
+      this.pitch  = Math.max(-85, Math.min(85, this.pitch));
+      this.lastX  = e.clientX;
+      this.lastY  = e.clientY;
+      const r = Math.PI / 180;
+      this.el.object3D.rotation.set(this.pitch * r, this.yaw * r, 0, 'YXZ');
+    },
+    _pu() { this.down = false; }
+  });
+
+  // ─────────────────────────────────────────────────────────────
+  // equirect shader — renders the video sphere with a soft seam
+  // blend at the two stitching seams (u ≈ 0.25 and u ≈ 0.75).
+  // Seams come from the dfisheye-to-equirect projection in ffmpeg.
+  // ─────────────────────────────────────────────────────────────
+  AFRAME.registerShader('equirect', {
+    schema: {
+      src:       { type: 'map',    is: 'uniform' },
+      seamWidth: { type: 'number', is: 'uniform', default: 0.009 }
+    },
+
+    vertexShader: `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+
+    fragmentShader: `
+      uniform sampler2D src;
+      uniform float seamWidth;
+      varying vec2 vUv;
+
+      /* 5-tap horizontal box-blur centred at (seamU, v) */
+      vec4 blurAt(float seamU, float v) {
+        float h = seamWidth;
+        return (
+          texture2D(src, vec2(seamU - h*2.0, v)) +
+          texture2D(src, vec2(seamU - h,     v)) +
+          texture2D(src, vec2(seamU,         v)) +
+          texture2D(src, vec2(seamU + h,     v)) +
+          texture2D(src, vec2(seamU + h*2.0, v))
+        ) * 0.2;
+      }
+
+      void main() {
+        float u = vUv.x;
+        float v = vUv.y;
+
+        float d0 = abs(u - 0.25);
+        float d1 = abs(u - 0.75);
+        float d  = min(d0, d1);
+
+        vec4 raw = texture2D(src, vUv);
+
+        if (d < seamWidth) {
+          float seamU = (d0 < d1) ? 0.25 : 0.75;
+          /* t goes 0→1 as we move away from the seam centre */
+          float t     = smoothstep(0.0, seamWidth, d);
+          vec4  blurred = blurAt(seamU, v);
+          gl_FragColor  = mix(blurred, raw, t);
+        } else {
+          gl_FragColor = raw;
+        }
+      }
+    `
+  });
+  </script>
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #0a0a0a;
+      color: #e0e0e0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* ── top bar ── */
+    #topbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 16px;
+      background: #111;
+      border-bottom: 1px solid #1f1f1f;
+      flex-shrink: 0;
+      z-index: 10;
+    }
+    #topbar h1 {
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+      color: #888;
+      flex-shrink: 0;
+    }
+    #clip-label {
+      font-size: 13px;
+      color: #ccc;
+      flex: 1;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    #clip-counter {
+      font-size: 12px;
+      color: #555;
+      flex-shrink: 0;
+    }
+    .badge {
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: .05em;
+      padding: 2px 6px;
+      border-radius: 4px;
+      flex-shrink: 0;
+    }
+    .badge.studio { background: #1a2535; color: #60b4ff; border: 1px solid #1e3a55; }
+    .badge.eq     { background: #1a2e1a; color: #4caf50; border: 1px solid #2a4a2a; }
+    .badge.raw    { background: #2a2218; color: #888;    border: 1px solid #3a3020; }
+
+    /* ── scene wrapper ── */
+    #scene-wrap {
+      flex: 1;
+      position: relative;
+      overflow: hidden;
+    }
+    a-scene { position: absolute !important; inset: 0; }
+
+    /* ── loading overlay ── */
+    #loading {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 14px;
+      background: rgba(10,10,10,.85);
+      z-index: 5;
+      pointer-events: none;
+      transition: opacity .3s;
+    }
+    #loading.hidden { opacity: 0; }
+    .spinner {
+      width: 36px; height: 36px;
+      border: 3px solid #222;
+      border-top-color: #666;
+      border-radius: 50%;
+      animation: spin .8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #loading p { font-size: 13px; color: #666; }
+
+    /* ── bottom controls ── */
+    #controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 16px;
+      background: #111;
+      border-top: 1px solid #1f1f1f;
+      flex-shrink: 0;
+    }
+
+    .nav-btn {
+      display: flex; align-items: center; justify-content: center;
+      width: 32px; height: 32px;
+      border-radius: 6px;
+      border: 1px solid #2a2a2a;
+      background: #161616;
+      color: #888;
+      cursor: pointer;
+      flex-shrink: 0;
+      transition: background .15s, color .15s, border-color .15s;
+    }
+    .nav-btn:hover { background: #1e1e1e; color: #ccc; border-color: #3a3a3a; }
+    .nav-btn:disabled { opacity: .3; cursor: default; }
+    .nav-btn svg { width: 14px; height: 14px; }
+
+    #strip {
+      display: flex;
+      gap: 6px;
+      overflow-x: auto;
+      flex: 1;
+      scrollbar-width: thin;
+      scrollbar-color: #2a2a2a transparent;
+    }
+    #strip::-webkit-scrollbar { height: 4px; }
+    #strip::-webkit-scrollbar-thumb { background: #2a2a2a; border-radius: 2px; }
+
+    .clip-btn {
+      flex-shrink: 0;
+      padding: 5px 11px;
+      border-radius: 5px;
+      border: 1px solid #2a2a2a;
+      background: #161616;
+      color: #666;
+      font-size: 12px;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background .15s, color .15s, border-color .15s;
+    }
+    .clip-btn:hover { background: #1e1e1e; color: #aaa; border-color: #3a3a3a; }
+    .clip-btn.active { background: #1c1c1c; color: #e0e0e0; border-color: #444; }
+    .clip-btn.has-eq::after {
+      content: "●";
+      margin-left: 5px;
+      font-size: 6px;
+      color: #4caf50;
+      vertical-align: middle;
+    }
+
+    #play-btn {
+      display: flex; align-items: center; justify-content: center;
+      width: 32px; height: 32px;
+      border-radius: 6px;
+      border: 1px solid #2a2a2a;
+      background: #161616;
+      color: #888;
+      cursor: pointer;
+      flex-shrink: 0;
+      transition: background .15s, color .15s;
+    }
+    #play-btn:hover { background: #1e1e1e; color: #ccc; }
+    #play-btn svg { width: 14px; height: 14px; }
+
+    #hint {
+      position: absolute;
+      bottom: 58px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 11px;
+      color: #444;
+      pointer-events: none;
+      white-space: nowrap;
+      z-index: 4;
+      transition: opacity 2s;
+    }
+    #hint.fade { opacity: 0; }
+  </style>
+</head>
+<body>
+
+<div id="topbar">
+  <h1>360</h1>
+  <span id="clip-label">—</span>
+  <span id="clip-counter"></span>
+  <span id="clip-badge" class="badge"></span>
+</div>
+
+<div id="scene-wrap">
+  <div id="loading"><div class="spinner"></div><p>Loading…</p></div>
+  <span id="hint">Click &amp; drag to look around</span>
+
+  <a-scene
+    embedded
+    vr-mode-ui="enabled: false"
+    loading-screen="enabled: false"
+    renderer="antialias: false"
+  >
+    <a-assets id="assets"></a-assets>
+
+    <!--
+      Sphere rotation 0 0 0 → longitude 0° faces the camera by default.
+      With dfisheye-to-equirect projection, stitching seams are at
+      longitude ±90° (u=0.25 and u=0.75), i.e. to the left and right —
+      much less noticeable than if they were straight ahead.
+    -->
+    <a-entity
+      id="sphere"
+      geometry="primitive: sphere; radius: 5000; segmentsWidth: 128; segmentsHeight: 64"
+      material="shader: equirect; src: ; side: back"
+      rotation="0 0 0"
+    ></a-entity>
+
+    <a-camera
+      id="cam"
+      look-controls="enabled: false"
+      free-look
+      wasd-controls="enabled: false"
+      fov="75"
+    ></a-camera>
+  </a-scene>
+</div>
+
+<div id="controls">
+  <button class="nav-btn" id="prev-btn" title="Previous clip">
+    <svg viewBox="0 0 16 16"><path d="M10 3 L4 8 L10 13" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  </button>
+
+  <div id="strip"></div>
+
+  <button class="nav-btn" id="next-btn" title="Next clip">
+    <svg viewBox="0 0 16 16"><path d="M6 3 L12 8 L6 13" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  </button>
+
+  <button id="play-btn" title="Play / Pause">
+    <svg id="icon-play"  viewBox="0 0 16 16" fill="currentColor"><path d="M4 2.5 L13 8 L4 13.5 Z"/></svg>
+    <svg id="icon-pause" viewBox="0 0 16 16" fill="currentColor" style="display:none">
+      <rect x="3" y="2" width="4" height="12" rx="1"/>
+      <rect x="9" y="2" width="4" height="12" rx="1"/>
+    </svg>
+  </button>
+</div>
+
+<script>
+  const STATIC_CLIPS_INSV = [
+    "data/VID_20250911_112037_00_010.insv",
+    "data/VID_20250911_112219_00_011.insv",
+    "data/VID_20250911_112357_00_012.insv",
+    "data/VID_20250911_112532_00_013.insv",
+    "data/VID_20250911_112550_00_014.insv",
+    "data/VID_20250911_112759_00_015.insv",
+  ];
+
+  const equirectAvailable = {};   // data/equirect/ ffmpeg-converted files
+  const studioAvailable   = {};   // equi_video/ Insta360 Studio exports (highest quality)
+
+  let clips   = [];
+  let current = 0;
+  let videoEl = null;
+  let assetId = null;
+
+  const sphere    = document.getElementById("sphere");
+  const assets    = document.getElementById("assets");
+  const strip     = document.getElementById("strip");
+  const label     = document.getElementById("clip-label");
+  const counter   = document.getElementById("clip-counter");
+  const badge     = document.getElementById("clip-badge");
+  const loading   = document.getElementById("loading");
+  const prevBtn   = document.getElementById("prev-btn");
+  const nextBtn   = document.getElementById("next-btn");
+  const playBtn   = document.getElementById("play-btn");
+  const iconPlay  = document.getElementById("icon-play");
+  const iconPause = document.getElementById("icon-pause");
+  const hint      = document.getElementById("hint");
+
+  function basename(p) {
+    return p.split("/").pop().replace(/\.(insv|mp4)$/i, "");
+  }
+
+  function showLoading(v) { loading.classList.toggle("hidden", !v); }
+
+  function setPlayIcon(playing) {
+    iconPlay.style.display  = playing ? "none" : "";
+    iconPause.style.display = playing ? "" : "none";
+  }
+
+  function loadClip(idx) {
+    if (idx < 0 || idx >= clips.length) return;
+    current = idx;
+
+    const src = clips[idx];
+    showLoading(true);
+    updateUI();
+
+    if (videoEl) { videoEl.pause(); videoEl.src = ""; }
+
+    if (assetId) {
+      const old = document.getElementById(assetId);
+      if (old) old.remove();
+    }
+
+    assetId = "vid-" + idx;
+    const vid = document.createElement("video");
+    vid.id          = assetId;
+    vid.src         = src;
+    vid.crossOrigin = "anonymous";
+    vid.loop        = true;
+    vid.muted       = true;
+    vid.setAttribute("playsinline", "");
+    vid.preload     = "auto";
+
+    vid.addEventListener("canplay", () => {
+      showLoading(false);
+      vid.play().then(() => setPlayIcon(true)).catch(() => setPlayIcon(false));
+    }, { once: true });
+
+    vid.addEventListener("error", () => {
+      loading.querySelector("p").textContent =
+        "Could not decode — try converting to equirectangular MP4 first.";
+    });
+
+    vid.addEventListener("pause", () => setPlayIcon(false));
+    vid.addEventListener("play",  () => setPlayIcon(true));
+
+    assets.appendChild(vid);
+
+    // Set material src on the custom-shader entity
+    sphere.setAttribute("material", "src", "#" + assetId);
+
+    videoEl = vid;
+  }
+
+  function updateUI() {
+    const src      = clips[current] || "";
+    const isStudio = !!studioAvailable[current];
+    const isEq     = !isStudio && src.endsWith(".mp4");
+    label.textContent   = basename(src);
+    counter.textContent = `${current + 1} / ${clips.length}`;
+    if (isStudio) { badge.textContent = "studio"; badge.className = "badge studio"; }
+    else if (isEq){ badge.textContent = "360°";   badge.className = "badge eq"; }
+    else          { badge.textContent = "raw";     badge.className = "badge raw"; }
+    prevBtn.disabled = current === 0;
+    nextBtn.disabled = current === clips.length - 1;
+
+    document.querySelectorAll(".clip-btn").forEach((btn, i) => {
+      btn.classList.toggle("active",  i === current);
+      btn.classList.toggle("has-eq", !!(studioAvailable[i] || equirectAvailable[i]));
+    });
+
+    const active = strip.querySelector(".clip-btn.active");
+    if (active) active.scrollIntoView({ block: "nearest", inline: "center", behavior: "smooth" });
+  }
+
+  function buildStrip() {
+    strip.innerHTML = "";
+    clips.forEach((src, i) => {
+      const btn = document.createElement("button");
+      btn.className   = "clip-btn";
+      btn.textContent = basename(src);
+      btn.addEventListener("click", () => loadClip(i));
+      strip.appendChild(btn);
+    });
+  }
+
+  playBtn.addEventListener("click", () => {
+    if (!videoEl) return;
+    videoEl.paused ? videoEl.play() : videoEl.pause();
+  });
+
+  prevBtn.addEventListener("click", () => loadClip(current - 1));
+  nextBtn.addEventListener("click", () => loadClip(current + 1));
+
+  document.addEventListener("keydown", e => {
+    if (e.key === "ArrowLeft"  || e.key === "ArrowUp")   loadClip(current - 1);
+    if (e.key === "ArrowRight" || e.key === "ArrowDown")  loadClip(current + 1);
+    if (e.key === " ") { e.preventDefault(); playBtn.click(); }
+  });
+
+  setTimeout(() => hint.classList.add("fade"), 3500);
+
+  async function probeClip(insv, i) {
+    const name = insv.split("/").pop().replace(/\.insv$/i, "");
+    const [studioRes, eqRes] = await Promise.all([
+      fetch(`equi_video/${name}.mp4`,    { method: "HEAD" }).catch(() => null),
+      fetch(`data/equirect/${name}.mp4`, { method: "HEAD" }).catch(() => null),
+    ]);
+    if (studioRes?.ok)   studioAvailable[i]   = `equi_video/${name}.mp4`;
+    if (eqRes?.ok)       equirectAvailable[i]  = `data/equirect/${name}.mp4`;
+  }
+
+  async function init() {
+    const insvList = STATIC_CLIPS_INSV.slice();
+
+    await Promise.all(insvList.map((insv, i) => probeClip(insv, i)));
+
+    // Priority: Studio export > ffmpeg equirect > raw .insv
+    clips = insvList.map((insv, i) =>
+      studioAvailable[i] || equirectAvailable[i] || insv
+    );
+
+    buildStrip();
+    loadClip(0);
+
+    // Poll for new files while page is open
+    setInterval(async () => {
+      let changed = false;
+      await Promise.all(insvList.map(async (insv, i) => {
+        if (studioAvailable[i]) return;   // already best quality
+        const before = clips[i];
+        await probeClip(insv, i);
+        const after = studioAvailable[i] || equirectAvailable[i] || insv;
+        if (after !== before) { clips[i] = after; changed = true; }
+      }));
+      if (changed) { buildStrip(); updateUI(); }
+    }, 15_000);
+  }
+
+  const scene = document.querySelector("a-scene");
+  if (scene.hasLoaded) { init(); }
+  else { scene.addEventListener("loaded", init); }
+</script>
+</body>
+</html>
