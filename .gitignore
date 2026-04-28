@@ -1,10 +1,12 @@
 # Video assets — too large for git (GitHub 100 MB limit)
 *.insv
-*.mp4
 *.mov
 *.avi
 data/equirect/
-equi_video/
+
+# All MP4s except web-optimised versions in equi_video/
+*.mp4
+!equi_video/*_web.mp4
 
 # macOS
 .DS_Store

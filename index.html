@@ -504,12 +504,16 @@
 
   async function probeClip(insv, i) {
     const name = insv.split("/").pop().replace(/\.insv$/i, "");
-    const [studioRes, eqRes] = await Promise.all([
-      fetch(`equi_video/${name}.mp4`,    { method: "HEAD" }).catch(() => null),
-      fetch(`data/equirect/${name}.mp4`, { method: "HEAD" }).catch(() => null),
+    // Check full-quality Studio export first, then web-optimised fallback,
+    // then ffmpeg equirect, then raw insv.
+    const [studioRes, studioWebRes, eqRes] = await Promise.all([
+      fetch(`equi_video/${name}.mp4`,      { method: "HEAD" }).catch(() => null),
+      fetch(`equi_video/${name}_web.mp4`,  { method: "HEAD" }).catch(() => null),
+      fetch(`data/equirect/${name}.mp4`,   { method: "HEAD" }).catch(() => null),
     ]);
-    if (studioRes?.ok)   studioAvailable[i]   = `equi_video/${name}.mp4`;
-    if (eqRes?.ok)       equirectAvailable[i]  = `data/equirect/${name}.mp4`;
+    if (studioRes?.ok)    studioAvailable[i] = `equi_video/${name}.mp4`;
+    else if (studioWebRes?.ok) studioAvailable[i] = `equi_video/${name}_web.mp4`;
+    if (eqRes?.ok)        equirectAvailable[i] = `data/equirect/${name}.mp4`;
   }
 
   async function init() {
